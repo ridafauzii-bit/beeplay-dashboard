@@ -563,26 +563,33 @@ else:
         st.write("")  # spacing
         delete_click = st.button("🗑️ Delete selected", use_container_width=True)
 
-    # SAVE changes
-    if st.button("💾 Save changes"):
-        master = st.session_state.transactions.copy()
-        edited = edited_view.copy()
-        edited["date"] = pd.to_datetime(edited["date"], errors="coerce")
-        for c in ["hours","rental_revenue","snack_revenue"]:
-            edited[c] = pd.to_numeric(edited[c], errors="coerce")
+# SAVE changes (robust merge by tx_id)
+if st.button("💾 Save changes"):
+    master = st.session_state.transactions.copy()
+    edited = edited_view.copy()
 
-        if "tx_id" not in master.columns:
-            master["tx_id"] = None
-        master_idx = master.set_index("tx_id")
-        edited_idx = edited.set_index("tx_id")
+    # Normalize types coming back from editor
+    edited["tx_id"] = edited["tx_id"].astype(str)
+    master["tx_id"] = master.get("tx_id", pd.Series([None]*len(master))).astype(str)
 
-        for col in ["date","package","hours","rental_revenue","snack_type","snack_revenue"]:
-            master_idx.loc[edited_idx.index, col] = edited_idx[col]
+    edited["date"] = pd.to_datetime(edited["date"], errors="coerce")
+    for c in ["hours","rental_revenue","snack_revenue"]:
+        edited[c] = pd.to_numeric(edited[c], errors="coerce")
 
-        st.session_state.transactions = master_idx.reset_index()
-        ensure_tx_ids()
-        st.success("Changes saved.")
-        st.rerun()
+    # Build a lookup from edited (by tx_id)
+    ed_lookup = edited.set_index("tx_id")
+
+    # Update only rows that exist in master
+    mask = master["tx_id"].isin(ed_lookup.index)
+
+    # Assign column-by-column using map to keep alignment safe
+    for col in ["date","package","hours","rental_revenue","snack_type","snack_revenue"]:
+        master.loc[mask, col] = master.loc[mask, "tx_id"].map(ed_lookup[col])
+
+    st.session_state.transactions = master.reset_index(drop=True)
+    ensure_tx_ids()
+    st.success("Changes saved.")
+    st.rerun()
 
     # DELETE selected
     if delete_click:
@@ -641,3 +648,4 @@ with coly:
 
 st.markdown("---")
 st.markdown("**Tips**: Staff sees input-only view (today). Team sees full analytics. Use the sidebar to set Initial Capital, Costs, Targets, etc.")
+
