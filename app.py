@@ -1,4 +1,5 @@
-# BEE PLAY FINANCIAL REPORT - Streamlit Dashboard (Roles + Edit/Delete + Sidebar Settings)
+# BEE PLAY FINANCIAL REPORT - Streamlit Dashboard
+# Roles + Sidebar Settings + Inline Edit/Delete in "Transactions (in range)"
 # Run: python -m streamlit run app.py
 
 import io
@@ -18,13 +19,13 @@ from reportlab.lib.units import mm
 
 st.set_page_config(page_title="BEE PLAY Financial Report", layout="wide", page_icon="🎮")
 
-# ---------- SIMPLE USERS (edit these) ----------
+# ---------- USERS ----------
 USERS = {
     "staff1": {"password": "1234", "role": "staff"},  # input-only
     "team1":  {"password": "2025", "role": "team"},   # full access
 }
 
-# ---------- THEME (Neon, high-contrast) ----------
+# ---------- THEME ----------
 THEME_CSS = """
 <style>
 :root { --bg:#0b0f19; --panel:#10172a; --input:#1e293b; --border:#334155;
@@ -80,10 +81,8 @@ def excel_bytes(transactions: pd.DataFrame, summary: Dict[str, float]) -> bytes:
     output = io.BytesIO()
     with pd.ExcelWriter(output, engine="xlsxwriter") as writer:
         tx = transactions.copy()
-        if not tx.empty:
-            # ensure proper date string for Excel
-            if pd.api.types.is_datetime64_any_dtype(tx["date"]):
-                tx["date"] = tx["date"].dt.strftime("%Y-%m-%d")
+        if not tx.empty and pd.api.types.is_datetime64_any_dtype(tx["date"]):
+            tx["date"] = tx["date"].dt.strftime("%Y-%m-%d")
         tx.to_excel(writer, sheet_name="Transactions", index=False)
         summary_df = pd.DataFrame([{"Metric": k, "Value": v if isinstance(v, (int, float)) else str(v)} for k, v in summary.items()])
         summary_df.to_excel(writer, sheet_name="Summary", index=False)
@@ -118,7 +117,7 @@ def init_state():
             "rental_revenue": pd.Series([], dtype="float"),
             "snack_type": pd.Series([], dtype="object"),
             "snack_revenue": pd.Series([], dtype="float"),
-            "tx_id": pd.Series([], dtype="object"),  # unique ID for edit/delete
+            "tx_id": pd.Series([], dtype="object"),
         })
     if "config" not in st.session_state:
         st.session_state.config = {
@@ -134,14 +133,16 @@ def init_state():
         }
 
 def ensure_tx_ids():
-    """Make sure every transaction has a stable unique ID."""
     df = st.session_state.transactions
-    if "tx_id" not in df.columns or df["tx_id"].isna().any() or (df["tx_id"] == "").any():
-        df = df.copy()
-        if "tx_id" not in df.columns:
-            df["tx_id"] = None
-        df.loc[df["tx_id"].isna() | (df["tx_id"] == ""), "tx_id"] = [str(uuid.uuid4()) for _ in range((df["tx_id"].isna() | (df["tx_id"] == "")).sum())]
-        st.session_state.transactions = df
+    if df.empty:
+        return
+    df = df.copy()
+    if "tx_id" not in df.columns:
+        df["tx_id"] = None
+    mask = df["tx_id"].isna() | (df["tx_id"] == "")
+    if mask.any():
+        df.loc[mask, "tx_id"] = [str(uuid.uuid4()) for _ in range(mask.sum())]
+    st.session_state.transactions = df
 
 def load_csv(path="transactions.csv"):
     try:
@@ -152,6 +153,7 @@ def load_csv(path="transactions.csv"):
         if "tx_id" not in df.columns:
             df["tx_id"] = [str(uuid.uuid4()) for _ in range(len(df))]
         st.session_state.transactions = df
+        ensure_tx_ids()
         return True
     except Exception:
         return False
@@ -179,6 +181,7 @@ def add_sample_data():
             rows.append([d, pkg, float(hrs), float(price), snack_type, float(snack_rev), str(uuid.uuid4())])
     df = pd.DataFrame(rows, columns=["date","package","hours","rental_revenue","snack_type","snack_revenue","tx_id"])
     st.session_state.transactions = df
+    ensure_tx_ids()
 
 def filter_today(df: pd.DataFrame) -> pd.DataFrame:
     if df.empty: return df
@@ -203,7 +206,7 @@ def require_auth() -> Optional[str]:
     auth = st.session_state.auth
     return auth["role"]
 
-# ---------- KPI / FINANCE (team) ----------
+# ---------- KPI / FINANCE ----------
 def kpis_for_range(df: pd.DataFrame, cfg: dict, start: date, end: date) -> dict:
     rental_rev = df["rental_revenue"].sum() if not df.empty else 0.0
     snack_rev  = df["snack_revenue"].sum() if not df.empty else 0.0
@@ -346,6 +349,7 @@ def upload_widget():
             # append
             cols = ["date","package","hours","rental_revenue","snack_type","snack_revenue","tx_id"]
             st.session_state.transactions = pd.concat([st.session_state.transactions, df_new[cols]], ignore_index=True)
+            ensure_tx_ids()
             st.success(f"Imported {len(df_new)} rows.")
         except Exception as e:
             st.error(f"Failed to read file: {e}")
@@ -371,6 +375,7 @@ def add_transaction_form():
                 "tx_id":[str(uuid.uuid4())],
             })
             st.session_state.transactions = pd.concat([st.session_state.transactions, new_row], ignore_index=True)
+            ensure_tx_ids()
             st.success("Transaction added.")
         if b2.button("🧹 Clear Form"):
             st.rerun()
@@ -389,7 +394,7 @@ if not role:
 # HEADER
 st.markdown(f"# 🎮 {cfg['brand']}")
 
-# STAFF VIEW (input-only, today's table)
+# STAFF VIEW (input-only)
 if role == "staff":
     with st.sidebar:
         st.markdown("---")
@@ -422,13 +427,13 @@ if role == "staff":
             ok = load_csv(); st.success("Loaded transactions.csv") if ok else st.error("Failed to load transactions.csv")
     st.stop()
 
-# TEAM VIEW (full dashboard) ------------->
+# TEAM VIEW (full dashboard)
 def filter_by_range(df: pd.DataFrame, start: date, end: date) -> pd.DataFrame:
     if df.empty: return df.copy()
     mask = (df['date'].dt.date >= start) & (df['date'].dt.date <= end)
     return df.loc[mask].copy()
 
-# Full sidebar settings (includes Initial Capital)
+# Sidebar settings (includes Initial Capital)
 sidebar_settings(cfg)
 
 # Period filters
@@ -505,7 +510,6 @@ with right:
         st.info("No data in selected range.")
     else:
         total_r = k["rental_revenue"]; total_s = k["snack_revenue"]
-        total_val = max(total_r + total_s, 1.0)
         import matplotlib.pyplot as plt
         fig, ax = plt.subplots()
         ax.pie([total_r, total_s], labels=["Rental","Snacks"], autopct="%1.1f%%", startangle=90)
@@ -514,31 +518,24 @@ with right:
 
 st.divider()
 
-# Transactions table
-st.subheader("🧾 Transactions (in range)")
-st.dataframe(
-    df_range.sort_values("date", ascending=False).assign(
-        date=lambda d: d["date"].dt.strftime("%Y-%m-%d"),
-        rental_revenue=lambda d: d["rental_revenue"].map(format_idr),
-        snack_revenue=lambda d: d["snack_revenue"].map(format_idr),
-        hours=lambda d: d["hours"].round(2),
-    ),
-    use_container_width=True
-)
+# ================== Transactions (in range) — EDIT & DELETE ==================
+st.subheader("🧾 Transactions (in range) — edit & delete")
 
-# ===== Manage Transactions (Team) =====
-st.subheader("✏️ Manage Transactions (Team)")
 if df_range.empty:
-    st.info("No transactions in the selected range to edit.")
+    st.info("No transactions in the selected range.")
 else:
-    edit_cols = ["date","package","hours","rental_revenue","snack_type","snack_revenue","tx_id"]
-    edit_df = df_range[edit_cols].copy()
+    view_cols = ["date","package","hours","rental_revenue","snack_type","snack_revenue","tx_id"]
+    view = df_range[view_cols].copy()
 
-    # Editor (tx_id read-only)
-    edited_df = st.data_editor(
-        edit_df,
+    # Editor-friendly types
+    view["date"] = pd.to_datetime(view["date"], errors="coerce").dt.date
+    for c in ["hours","rental_revenue","snack_revenue"]:
+        view[c] = pd.to_numeric(view[c], errors="coerce")
+
+    edited_view = st.data_editor(
+        view.sort_values("date", ascending=False),
         use_container_width=True,
-        num_rows="fixed",
+        num_rows="fixed",  # add via form/upload; here we edit existing
         column_config={
             "date": st.column_config.DateColumn(format="YYYY-MM-DD"),
             "hours": st.column_config.NumberColumn(step=0.5, min_value=0.0),
@@ -546,56 +543,64 @@ else:
             "snack_revenue": st.column_config.NumberColumn(step=1000, min_value=0),
             "tx_id": st.column_config.TextColumn(disabled=True, help="Row ID (read-only)"),
         },
-        key="tx_editor",
+        key="tx_editor_inline",
     )
 
-    # Build labels for delete selector
-    label_dates = pd.to_datetime(edited_df["date"], errors="coerce").dt.strftime("%Y-%m-%d").fillna("")
-    label_df = edited_df.copy()
+    # Build labels for deletion selector
+    label_df = edited_view.copy()
+    label_df["date"] = pd.to_datetime(label_df["date"], errors="coerce").dt.strftime("%Y-%m-%d").fillna("")
     label_df["label"] = (
-        label_dates + " | " +
+        label_df["date"] + " | " +
         label_df["package"].astype(str) + " | Rp" +
-        label_df["rental_revenue"].astype(float).astype(int).astype(str) +
-        " | ID:" + label_df["tx_id"].str[-6:]
+        label_df["rental_revenue"].fillna(0).astype(int).astype(str) +
+        " | ID:" + label_df["tx_id"].astype(str).str[-6:]
     )
     del_choices = {row["label"]: row["tx_id"] for _, row in label_df.iterrows()}
-    to_delete = st.multiselect("Select transactions to remove", options=list(del_choices.keys()))
+    dcol1, dcol2 = st.columns([3, 1])
+    with dcol1:
+        to_delete = st.multiselect("Select transaction(s) to delete", options=list(del_choices.keys()))
+    with dcol2:
+        st.write("")  # spacing
+        delete_click = st.button("🗑️ Delete selected", use_container_width=True)
 
-    csave, cdel = st.columns([1,1])
-    with csave:
-        if st.button("💾 Save edits"):
-            master = st.session_state.transactions.copy()
-            # Ensure proper types from editor
-            edited_df["date"] = pd.to_datetime(edited_df["date"], errors="coerce")
-            for col in ["hours","rental_revenue","snack_revenue"]:
-                edited_df[col] = pd.to_numeric(edited_df[col], errors="coerce")
-            # Update by tx_id
-            idx_map = {tid: i for i, tid in enumerate(master["tx_id"])}
-            for _, row in edited_df.iterrows():
-                tid = row["tx_id"]
-                if tid in idx_map:
-                    i = idx_map[tid]
-                    for col in ["date","package","hours","rental_revenue","snack_type","snack_revenue"]:
-                        master.at[i, col] = row[col]
-            st.session_state.transactions = master
-            st.success("Edits saved.")
+    # SAVE changes
+    if st.button("💾 Save changes"):
+        master = st.session_state.transactions.copy()
+        edited = edited_view.copy()
+        edited["date"] = pd.to_datetime(edited["date"], errors="coerce")
+        for c in ["hours","rental_revenue","snack_revenue"]:
+            edited[c] = pd.to_numeric(edited[c], errors="coerce")
+
+        if "tx_id" not in master.columns:
+            master["tx_id"] = None
+        master_idx = master.set_index("tx_id")
+        edited_idx = edited.set_index("tx_id")
+
+        for col in ["date","package","hours","rental_revenue","snack_type","snack_revenue"]:
+            master_idx.loc[edited_idx.index, col] = edited_idx[col]
+
+        st.session_state.transactions = master_idx.reset_index()
+        ensure_tx_ids()
+        st.success("Changes saved.")
+        st.rerun()
+
+    # DELETE selected
+    if delete_click:
+        if not to_delete:
+            st.warning("No rows selected.")
+        else:
+            del_ids = set(del_choices[label] for label in to_delete)
+            before = len(st.session_state.transactions)
+            st.session_state.transactions = st.session_state.transactions[
+                ~st.session_state.transactions["tx_id"].isin(del_ids)
+            ].reset_index(drop=True)
+            ensure_tx_ids()
+            after = len(st.session_state.transactions)
+            st.success(f"Deleted {before - after} transaction(s).")
             st.rerun()
+# ============================================================================
 
-    with cdel:
-        if st.button("🗑️ Delete selected"):
-            if not to_delete:
-                st.warning("No rows selected.")
-            else:
-                del_ids = set(del_choices[label] for label in to_delete)
-                before = len(st.session_state.transactions)
-                st.session_state.transactions = st.session_state.transactions[
-                    ~st.session_state.transactions["tx_id"].isin(del_ids)
-                ].reset_index(drop=True)
-                after = len(st.session_state.transactions)
-                st.success(f"Deleted {before - after} transaction(s).")
-                st.rerun()
-
-# Input & Upload (available to team too)
+# Input & Upload (also available to team)
 st.markdown("### ➕ Add / Upload")
 add_transaction_form()
 upload_widget()
