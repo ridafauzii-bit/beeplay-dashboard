@@ -1,6 +1,6 @@
 # BEE PLAY FINANCIAL REPORT - Streamlit Dashboard
-# Roles + Sidebar Settings + Inline Edit/Delete in "Transactions (in range)"
-# Run: python -m streamlit run app.py
+# Roles + Sidebar Settings + Inline Edit/Delete + CSV Autosave + Google Sheets (optional)
+# Run locally:  python -m streamlit run app.py
 
 import io
 import uuid
@@ -16,6 +16,10 @@ import streamlit as st
 from reportlab.lib.pagesizes import A4
 from reportlab.pdfgen import canvas
 from reportlab.lib.units import mm
+
+# Google Sheets (optional: used if secrets provided)
+import gspread
+from google.oauth2.service_account import Credentials
 
 st.set_page_config(page_title="BEE PLAY Financial Report", layout="wide", page_icon="🎮")
 
@@ -144,6 +148,7 @@ def ensure_tx_ids():
         df.loc[mask, "tx_id"] = [str(uuid.uuid4()) for _ in range(mask.sum())]
     st.session_state.transactions = df
 
+# ---------- Local CSV ----------
 def load_csv(path="transactions.csv"):
     try:
         df = pd.read_csv(path, parse_dates=["date"])
@@ -159,8 +164,13 @@ def load_csv(path="transactions.csv"):
         return False
 
 def save_csv(path="transactions.csv"):
-    st.session_state.transactions.to_csv(path, index=False)
+    try:
+        st.session_state.transactions.to_csv(path, index=False)
+        return True
+    except Exception:
+        return False
 
+# ---------- Sample data ----------
 def add_sample_data():
     today = date.today()
     start = today - timedelta(days=20)
@@ -182,6 +192,83 @@ def add_sample_data():
     df = pd.DataFrame(rows, columns=["date","package","hours","rental_revenue","snack_type","snack_revenue","tx_id"])
     st.session_state.transactions = df
     ensure_tx_ids()
+
+# ---------- Google Sheets (optional) ----------
+def _gs_client():
+    try:
+        creds_info = st.secrets["google_service_account"]
+        scopes = ["https://www.googleapis.com/auth/spreadsheets"]
+        creds = Credentials.from_service_account_info(creds_info, scopes=scopes)
+        return gspread.authorize(creds)
+    except Exception:
+        return None
+
+def gs_open():
+    gc = _gs_client()
+    if not gc: return None, None
+    ss_id = st.secrets["sheets"]["spreadsheet_id"]
+    ws_name = st.secrets["sheets"]["worksheet_name"]
+    sh = gc.open_by_key(ss_id)
+    ws = sh.worksheet(ws_name)
+    return sh, ws
+
+def gs_load_transactions() -> bool:
+    try:
+        _, ws = gs_open()
+        if not ws: return False
+        rows = ws.get_all_records()
+        df = pd.DataFrame(rows)
+        if df.empty:
+            st.session_state.transactions = st.session_state.transactions.iloc[0:0]
+            ensure_tx_ids()
+            return True
+        # types
+        df["date"] = pd.to_datetime(df["date"], errors="coerce")
+        for c in ["hours","rental_revenue","snack_revenue"]:
+            df[c] = pd.to_numeric(df[c], errors="coerce").fillna(0.0)
+        df["package"] = df["package"].astype(str)
+        df["snack_type"] = df["snack_type"].astype(str)
+        if "tx_id" not in df.columns:
+            df["tx_id"] = [str(uuid.uuid4()) for _ in range(len(df))]
+        st.session_state.transactions = df
+        ensure_tx_ids()
+        return True
+    except Exception:
+        return False
+
+def gs_save_transactions() -> bool:
+    try:
+        _, ws = gs_open()
+        if not ws: return False
+        df = st.session_state.transactions.copy()
+
+        if "date" in df.columns and pd.api.types.is_datetime64_any_dtype(df["date"]):
+            df["date"] = df["date"].dt.strftime("%Y-%m-%d")
+
+        cols = ["date","package","hours","rental_revenue","snack_type","snack_revenue","tx_id"]
+        for c in cols:
+            if c not in df.columns:
+                df[c] = ""
+        df = df[cols]
+
+        ws.clear()
+        ws.append_row(cols)
+        if len(df) > 0:
+            ws.append_rows(df.values.tolist())
+        return True
+    except Exception:
+        return False
+
+# ---------- Autosave: CSV (always) + Google Sheets (if configured) ----------
+def autosave_all():
+    try:
+        st.session_state.transactions.to_csv("transactions.csv", index=False)
+    except Exception:
+        pass
+    try:
+        gs_save_transactions()
+    except Exception:
+        pass
 
 def filter_today(df: pd.DataFrame) -> pd.DataFrame:
     if df.empty: return df
@@ -300,16 +387,27 @@ def sidebar_settings(cfg):
         st.markdown("### 💾 Data")
         col_a, col_b, col_c = st.columns(3)
         with col_a:
-            if st.button("📥 Load CSV"):
-                ok = load_csv()
-                st.success("Loaded transactions.csv") if ok else st.error("Failed to load transactions.csv")
+            if st.button("📥 Load Data"):
+                ok = gs_load_transactions()
+                if not ok:
+                    ok = load_csv()
+                if ok:
+                    st.success("Loaded data")
+                else:
+                    st.error("Failed to load")
         with col_b:
-            if st.button("📤 Save CSV"):
-                save_csv()
-                st.success("Saved to transactions.csv")
+            if st.button("📤 Save Data"):
+                ok = gs_save_transactions()
+                if not ok:
+                    ok = save_csv()
+                if ok:
+                    st.success("Saved data")
+                else:
+                    st.error("Failed to save")
         with col_c:
             if st.button("🧪 Load Sample Data"):
                 add_sample_data()
+                autosave_all()
                 st.success("Sample data loaded")
 
         st.markdown("---")
@@ -350,6 +448,7 @@ def upload_widget():
             cols = ["date","package","hours","rental_revenue","snack_type","snack_revenue","tx_id"]
             st.session_state.transactions = pd.concat([st.session_state.transactions, df_new[cols]], ignore_index=True)
             ensure_tx_ids()
+            autosave_all()
             st.success(f"Imported {len(df_new)} rows.")
         except Exception as e:
             st.error(f"Failed to read file: {e}")
@@ -376,6 +475,7 @@ def add_transaction_form():
             })
             st.session_state.transactions = pd.concat([st.session_state.transactions, new_row], ignore_index=True)
             ensure_tx_ids()
+            autosave_all()
             st.success("Transaction added.")
         if b2.button("🧹 Clear Form"):
             st.rerun()
@@ -418,13 +518,26 @@ if role == "staff":
         ),
         use_container_width=True
     )
+    # Staff quick save/load (uses same persistence)
     c1, c2 = st.columns(2)
     with c1:
-        if st.button("📤 Save CSV"):
-            save_csv(); st.success("Saved to transactions.csv")
+        if st.button("📤 Save Data"):
+            ok = gs_save_transactions()
+            if not ok:
+                ok = save_csv()
+            if ok:
+                st.success("Saved")
+            else:
+                st.error("Failed to save")
     with c2:
-        if st.button("📥 Load CSV"):
-            ok = load_csv(); st.success("Loaded transactions.csv") if ok else st.error("Failed to load transactions.csv")
+        if st.button("📥 Load Data"):
+            ok = gs_load_transactions()
+            if not ok:
+                ok = load_csv()
+            if ok:
+                st.success("Loaded")
+            else:
+                st.error("Failed to load")
     st.stop()
 
 # TEAM VIEW (full dashboard)
@@ -535,7 +648,7 @@ else:
     edited_view = st.data_editor(
         view.sort_values("date", ascending=False),
         use_container_width=True,
-        num_rows="fixed",  # add via form/upload; here we edit existing
+        num_rows="fixed",  # edit existing in range (add via form/upload)
         column_config={
             "date": st.column_config.DateColumn(format="YYYY-MM-DD"),
             "hours": st.column_config.NumberColumn(step=0.5, min_value=0.0),
@@ -546,7 +659,8 @@ else:
         key="tx_editor_inline",
     )
 
-    # Build labels for deletion selector
+    # Prepare deletion choices
+    edited_view["tx_id"] = edited_view["tx_id"].astype(str)  # IMPORTANT for stable matching
     label_df = edited_view.copy()
     label_df["date"] = pd.to_datetime(label_df["date"], errors="coerce").dt.strftime("%Y-%m-%d").fillna("")
     label_df["label"] = (
@@ -556,6 +670,7 @@ else:
         " | ID:" + label_df["tx_id"].astype(str).str[-6:]
     )
     del_choices = {row["label"]: row["tx_id"] for _, row in label_df.iterrows()}
+
     dcol1, dcol2 = st.columns([3, 1])
     with dcol1:
         to_delete = st.multiselect("Select transaction(s) to delete", options=list(del_choices.keys()))
@@ -563,46 +678,46 @@ else:
         st.write("")  # spacing
         delete_click = st.button("🗑️ Delete selected", use_container_width=True)
 
-# SAVE changes (robust merge by tx_id)
-if st.button("💾 Save changes"):
-    master = st.session_state.transactions.copy()
-    edited = edited_view.copy()
+    # SAVE changes (robust merge by tx_id)
+    if st.button("💾 Save changes"):
+        master = st.session_state.transactions.copy()
 
-    # Normalize types coming back from editor
-    edited["tx_id"] = edited["tx_id"].astype(str)
-    master["tx_id"] = master.get("tx_id", pd.Series([None]*len(master))).astype(str)
+        edited = edited_view.copy()
+        edited["tx_id"] = edited["tx_id"].astype(str)
+        master["tx_id"] = master.get("tx_id", pd.Series([None]*len(master))).astype(str)
 
-    edited["date"] = pd.to_datetime(edited["date"], errors="coerce")
-    for c in ["hours","rental_revenue","snack_revenue"]:
-        edited[c] = pd.to_numeric(edited[c], errors="coerce")
+        edited["date"] = pd.to_datetime(edited["date"], errors="coerce")
+        for c in ["hours","rental_revenue","snack_revenue"]:
+            edited[c] = pd.to_numeric(edited[c], errors="coerce")
 
-    # Build a lookup from edited (by tx_id)
-    ed_lookup = edited.set_index("tx_id")
+        ed_lookup = edited.set_index("tx_id")
+        mask = master["tx_id"].isin(ed_lookup.index)
 
-    # Update only rows that exist in master
-    mask = master["tx_id"].isin(ed_lookup.index)
+        for col in ["date","package","hours","rental_revenue","snack_type","snack_revenue"]:
+            master.loc[mask, col] = master.loc[mask, "tx_id"].map(ed_lookup[col])
 
-    # Assign column-by-column using map to keep alignment safe
-    for col in ["date","package","hours","rental_revenue","snack_type","snack_revenue"]:
-        master.loc[mask, col] = master.loc[mask, "tx_id"].map(ed_lookup[col])
+        st.session_state.transactions = master.reset_index(drop=True)
+        ensure_tx_ids()
+        autosave_all()
+        st.success("Changes saved.")
+        st.rerun()
 
-    st.session_state.transactions = master.reset_index(drop=True)
-    ensure_tx_ids()
-    st.success("Changes saved.")
-    st.rerun()
-
-    # DELETE selected
+    # DELETE selected (force string tx_id match)
     if delete_click:
         if not to_delete:
             st.warning("No rows selected.")
         else:
-            del_ids = set(del_choices[label] for label in to_delete)
-            before = len(st.session_state.transactions)
-            st.session_state.transactions = st.session_state.transactions[
-                ~st.session_state.transactions["tx_id"].isin(del_ids)
-            ].reset_index(drop=True)
+            del_ids = {str(del_choices[label]) for label in to_delete if label in del_choices}
+            master = st.session_state.transactions.copy()
+            master["tx_id"] = master.get("tx_id", pd.Series([None]*len(master))).astype(str)
+
+            before = len(master)
+            master = master[~master["tx_id"].isin(del_ids)].reset_index(drop=True)
+            st.session_state.transactions = master
+
             ensure_tx_ids()
-            after = len(st.session_state.transactions)
+            autosave_all()
+            after = len(master)
             st.success(f"Deleted {before - after} transaction(s).")
             st.rerun()
 # ============================================================================
@@ -648,4 +763,3 @@ with coly:
 
 st.markdown("---")
 st.markdown("**Tips**: Staff sees input-only view (today). Team sees full analytics. Use the sidebar to set Initial Capital, Costs, Targets, etc.")
-
