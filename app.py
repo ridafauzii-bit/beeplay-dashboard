@@ -336,7 +336,7 @@ def _gs_client():
 def gs_open(section="sheets", default_ws="transactions"):
     gc = _gs_client()
     if not gc: return None, None
-    ss_id = st.secrets["sheets"]["spreadsheet_id"]
+    ss_id = st.secrets["sheets"]["spreadsheet_id"]  # one spreadsheet for all tabs
     ws_name = st.secrets.get(section, {}).get("worksheet_name", default_ws)
     sh = gc.open_by_key(ss_id)
     ws = sh.worksheet(ws_name)
@@ -687,7 +687,6 @@ def upload_transactions_widget():
                 st.error(f"Missing columns in file: {missing}")
                 return
             df_new["date"] = pd.to_datetime(df_new["date"], errors="coerce", infer_datetime_format=True)
-            # if most failed, try dayfirst parsing (DD/MM/YYYY)
             if df_new["date"].isna().mean() > 0.5:
                 df_new["date"] = pd.to_datetime(df_new["date"], errors="coerce", dayfirst=True, infer_datetime_format=True)
             for col in ["hours","rental_revenue","snack_revenue"]:
@@ -835,16 +834,13 @@ if role == "staff":
     # ===== Robust TODAY filter (handles ISO, DD/MM/YYYY, strings, datetimes) =====
     df_today = st.session_state.transactions.copy()
     if not df_today.empty:
-        # 1) try default/infer
         d0 = pd.to_datetime(df_today["date"], errors="coerce", infer_datetime_format=True)
-        # 2) if majority failed, try day-first (31/08/2025)
         if d0.isna().mean() > 0.5:
             d0 = pd.to_datetime(df_today["date"], errors="coerce", dayfirst=True, infer_datetime_format=True)
         df_today["__date_dt"] = d0
         df_today = df_today[~df_today["__date_dt"].isna()].copy()
         df_today["__date_only"] = df_today["__date_dt"].dt.date
         df_today = df_today[df_today["__date_only"] == date.today()].copy()
-        # Use parsed date for display
         df_today["date"] = df_today["__date_dt"]
 
     # ---- Debug block (remove later if you want) ----
@@ -855,47 +851,52 @@ if role == "staff":
     if df_today.empty:
         st.info("No transactions for today yet.")
     else:
+        # Make it look like team table, but read-only fields + a deletable checkbox column
         view_today = df_today.sort_values("__date_dt", ascending=False).copy()
-        view_today["date"] = pd.to_datetime(view_today["date"], errors="coerce").dt.strftime("%Y-%m-%d")
-        view_today["hours"] = pd.to_numeric(view_today["hours"], errors="coerce").round(2)
-        view_today["rental_revenue"] = pd.to_numeric(view_today["rental_revenue"], errors="coerce").fillna(0).map(format_idr)
-        view_today["snack_revenue"] = pd.to_numeric(view_today["snack_revenue"], errors="coerce").fillna(0).map(format_idr)
-        if "payment_method" not in view_today.columns:
-            view_today["payment_method"] = "Cash"
-        cols_today = ["date","time_play","package","hours","rental_revenue","snack_type","snack_revenue","payment_method","tx_id"]
-        st.dataframe(view_today[cols_today], use_container_width=True)
+        view_today["date"] = pd.to_datetime(view_today["date"], errors="coerce").dt.date
+        for c in ["hours","rental_revenue","snack_revenue"]:
+            view_today[c] = pd.to_numeric(view_today[c], errors="coerce").fillna(0)
+        view_today["__delete__"] = False
 
-        # Staff DELETE today's transactions (no edit)
-        label_df = view_today.copy()
-        tmp_val = pd.to_numeric(
-            label_df["rental_revenue"].astype(str).str.replace("Rp","").str.replace(".",""),
-            errors="coerce"
-        ).fillna(0).astype(int).astype(str)
-        label_df["label"] = (
-            label_df["date"].astype(str) + " " +
-            label_df["time_play"].astype(str) + " | " +
-            label_df["package"].astype(str) + " | " +
-            label_df["payment_method"].astype(str) + " | Rp" +
-            tmp_val + " | ID:" + label_df["tx_id"].astype(str).str[-6:]
+        cols_today = ["date","time_play","package","hours","rental_revenue","snack_type","snack_revenue","payment_method","tx_id","__delete__"]
+        view_today = view_today[cols_today]
+
+        edited_today = st.data_editor(
+            view_today,
+            use_container_width=True,
+            num_rows="fixed",
+            column_config={
+                "date": st.column_config.DateColumn(format="YYYY-MM-DD", disabled=True),
+                "time_play": st.column_config.TextColumn(disabled=True),
+                "package": st.column_config.TextColumn(disabled=True),
+                "hours": st.column_config.NumberColumn(step=0.5, min_value=0.0, disabled=True),
+                "rental_revenue": st.column_config.NumberColumn(step=1000, min_value=0, disabled=True),
+                "snack_type": st.column_config.TextColumn(disabled=True),
+                "snack_revenue": st.column_config.NumberColumn(step=1000, min_value=0, disabled=True),
+                "payment_method": st.column_config.TextColumn(disabled=True),
+                "tx_id": st.column_config.TextColumn(disabled=True, help="Row ID (read-only)"),
+                "__delete__": st.column_config.CheckboxColumn(label="✅ Delete?", help="Tick to delete this transaction", default=False),
+            },
+            key="staff_today_editor",
         )
-        choices = {row["label"]: row["tx_id"] for _, row in label_df.iterrows()}
 
-        d1, d2 = st.columns([3,1])
-        with d1:
-            to_del = st.multiselect("Select today’s transaction(s) to delete", options=list(choices.keys()), key="staff_del_multisel")
-        with d2:
-            st.write("")
-            del_click = st.button("🗑️ Delete selected", use_container_width=True, key="btn_staff_delete")
+        del_col1, del_col2 = st.columns([3,1])
+        with del_col1:
+            st.caption("Tick the rows to delete, then press the button.")
+        with del_col2:
+            do_delete = st.button("🗑️ Delete selected", use_container_width=True, key="btn_staff_delete")
 
-        if del_click:
-            if not to_del:
-                st.warning("No rows selected.")
+        if do_delete:
+            to_delete_ids = edited_today.loc[edited_today["__delete__"] == True, "tx_id"].astype(str).tolist()
+            if not to_delete_ids:
+                st.warning("No rows ticked for deletion.")
             else:
-                del_ids = {str(choices[label]) for label in to_del if label in choices}
                 master = st.session_state.transactions.copy()
                 master["tx_id"] = master.get("tx_id", pd.Series([None]*len(master))).astype(str)
                 before = len(master)
-                master = master[~master["tx_id"].isin(del_ids)].reset_index(drop=True)
+                today_ids = set(df_today["tx_id"].astype(str).tolist())
+                to_delete_ids = [x for x in to_delete_ids if x in today_ids]  # safety: only today's rows
+                master = master[~master["tx_id"].isin(to_delete_ids)].reset_index(drop=True)
                 st.session_state.transactions = master
                 ensure_tx_ids()
                 autosave_all()
@@ -1219,15 +1220,21 @@ if not exp_range.empty:
     for i, row in top5.iterrows():
         summary_export[f"Top Expense {i+1}"] = f"{row['category']} — {format_idr(row['amount'])}"
 
+def excel_bytes_wrapper():
+    return excel_bytes(df_range, exp_range, summary_export)
+
+def pdf_bytes_wrapper():
+    lines = {k: (format_idr(v) if isinstance(v, (int,float)) and ("%" not in k) else str(v)) for k, v in summary_export.items()}
+    return pdf_bytes("BEE PLAY - Financial Summary", lines)
+
 colx, coly = st.columns(2)
 with colx:
-    x_bytes = excel_bytes(df_range, exp_range, summary_export)
+    x_bytes = excel_bytes_wrapper()
     st.download_button("⬇️ Download Excel (Transactions + Expenses + Summary)", x_bytes,
         file_name=f"BeePlay_Report_{start}_to_{end}.xlsx",
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", key="dl_xlsx")
 with coly:
-    pdf_lines = {k: (format_idr(v) if isinstance(v, (int,float)) and ("%" not in k) else str(v)) for k, v in summary_export.items()}
-    pdf_bytes_data = pdf_bytes("BEE PLAY - Financial Summary", pdf_lines)
+    pdf_bytes_data = pdf_bytes_wrapper()
     st.download_button("⬇️ Download PDF (Summary)", pdf_bytes_data,
         file_name=f"BeePlay_Summary_{start}_to_{end}.pdf",
         mime="application/pdf", key="dl_pdf")
