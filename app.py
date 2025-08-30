@@ -859,10 +859,6 @@ if not df_today.empty:
 
 
     st.subheader("🧾 Today's Transactions")
-# Debugging block — remove later
-st.caption("Debug: last 5 raw rows in session_state.transactions")
-if not st.session_state.transactions.empty:
-    st.write(st.session_state.transactions.tail()[["date","time_play","package","payment_method"]])
 
     if df_today.empty:
         st.info("No transactions for today yet.")
@@ -1261,4 +1257,5 @@ with coly:
 
 st.markdown("---")
 st.markdown("**Notes**: Income = rental + snack sales. Expenses are recorded in the Expenses section. BEP & CM use planning inputs (fixed costs & variable settings). ROI includes actual expenses.")
+
 
