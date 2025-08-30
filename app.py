@@ -1,10 +1,9 @@
 # BEE PLAY FINANCIAL REPORT - Streamlit Dashboard (Income + Expenses + Budgets)
-# Single-page layout, roles, inline edit/delete, CSV autosave + Google Sheets for:
-# - transactions (worksheet: "transactions")
-# - expenses (worksheet: "expenses")
-# - settings (worksheet: "settings")
+# Roles: staff (today input + edit + delete), team (full dashboard + edit/delete)
+# Local autosave (CSV/JSON) + Google Sheets sync (transactions/expenses/settings)
+# Exports to Excel/PDF
 #
-# Run locally:  python -m streamlit run app.py
+# Run:  python -m streamlit run app.py
 
 import io
 import json
@@ -30,7 +29,7 @@ st.set_page_config(page_title="BEE PLAY Financial Report", layout="wide", page_i
 
 # ---------- USERS ----------
 USERS = {
-    "staff1": {"password": "1234", "role": "staff"},  # input-only
+    "staff1": {"password": "1234", "role": "staff"},  # input + edit/delete (today only)
     "team1":  {"password": "2025", "role": "team"},   # full
 }
 
@@ -707,7 +706,7 @@ def upload_transactions_widget():
             ensure_tx_ids()
             autosave_all()
             st.success(f"Imported {len(df_new)} rows.")
-            st.rerun()  # refresh immediately
+            st.rerun()
         except Exception as e:
             st.error(f"Failed to read file: {e}")
 
@@ -772,7 +771,7 @@ def add_transaction_form():
             ensure_tx_ids()
             autosave_all()
             st.success("Transaction added & saved.")
-            st.rerun()  # show in staff "today" immediately
+            st.rerun()
         if b2.button("🧹 Clear Form", key="btn_clear_tx"):
             st.rerun()
 
@@ -816,7 +815,7 @@ if not role:
 # HEADER
 st.markdown(f"# 🎮 {cfg['brand']}")
 
-# ---------- STAFF VIEW (input-only) ----------
+# ---------- STAFF VIEW (today input + edit + delete) ----------
 if role == "staff":
     with st.sidebar:
         st.markdown("---")
@@ -825,13 +824,13 @@ if role == "staff":
             st.success("Logged out.")
             st.rerun()
 
-    st.info("**Staff Mode** — input and delete **today's** transactions. Expenses are hidden for staff.")
+    st.info("**Staff Mode** — add, edit, and delete **today's** transactions. Expenses are hidden for staff.")
     add_transaction_form()
     upload_transactions_widget()
 
     st.subheader("🧾 Today's Transactions")
 
-    # ===== Robust TODAY filter (handles ISO, DD/MM/YYYY, strings, datetimes) =====
+    # Robust TODAY filter (handles ISO, DD/MM/YYYY, strings, datetimes)
     df_today = st.session_state.transactions.copy()
     if not df_today.empty:
         d0 = pd.to_datetime(df_today["date"], errors="coerce", infer_datetime_format=True)
@@ -843,7 +842,7 @@ if role == "staff":
         df_today = df_today[df_today["__date_only"] == date.today()].copy()
         df_today["date"] = df_today["__date_dt"]
 
-    # ---- Debug block (remove later if you want) ----
+    # Debug (remove later)
     st.caption("Debug: last 5 raw rows in session_state.transactions")
     if not st.session_state.transactions.empty:
         st.write(st.session_state.transactions.tail()[["date","time_play","package","payment_method"]])
@@ -851,11 +850,11 @@ if role == "staff":
     if df_today.empty:
         st.info("No transactions for today yet.")
     else:
-        # Make it look like team table, but read-only fields + a deletable checkbox column
         view_today = df_today.sort_values("__date_dt", ascending=False).copy()
         view_today["date"] = pd.to_datetime(view_today["date"], errors="coerce").dt.date
         for c in ["hours","rental_revenue","snack_revenue"]:
             view_today[c] = pd.to_numeric(view_today[c], errors="coerce").fillna(0)
+        # Add a checkbox for deletion
         view_today["__delete__"] = False
 
         cols_today = ["date","time_play","package","hours","rental_revenue","snack_type","snack_revenue","payment_method","tx_id","__delete__"]
@@ -865,44 +864,69 @@ if role == "staff":
             view_today,
             use_container_width=True,
             num_rows="fixed",
+            disabled=False,  # NOW EDITABLE for staff
             column_config={
-                "date": st.column_config.DateColumn(format="YYYY-MM-DD", disabled=True),
-                "time_play": st.column_config.TextColumn(disabled=True),
-                "package": st.column_config.TextColumn(disabled=True),
-                "hours": st.column_config.NumberColumn(step=0.5, min_value=0.0, disabled=True),
-                "rental_revenue": st.column_config.NumberColumn(step=1000, min_value=0, disabled=True),
-                "snack_type": st.column_config.TextColumn(disabled=True),
-                "snack_revenue": st.column_config.NumberColumn(step=1000, min_value=0, disabled=True),
-                "payment_method": st.column_config.TextColumn(disabled=True),
+                "date": st.column_config.DateColumn(format="YYYY-MM-DD"),
+                "time_play": st.column_config.TextColumn(help="24h HH:MM"),
+                "package": st.column_config.TextColumn(),
+                "hours": st.column_config.NumberColumn(step=0.5, min_value=0.0),
+                "rental_revenue": st.column_config.NumberColumn(step=1000, min_value=0),
+                "snack_type": st.column_config.TextColumn(),
+                "snack_revenue": st.column_config.NumberColumn(step=1000, min_value=0),
+                "payment_method": st.column_config.SelectboxColumn(options=PAYMENT_OPTIONS),
                 "tx_id": st.column_config.TextColumn(disabled=True, help="Row ID (read-only)"),
-                "__delete__": st.column_config.CheckboxColumn(label="✅ Delete?", help="Tick to delete this transaction", default=False),
+                "__delete__": st.column_config.CheckboxColumn(label="✅ Delete?", default=False),
             },
             key="staff_today_editor",
         )
+        edited_today["tx_id"] = edited_today["tx_id"].astype(str)
 
-        del_col1, del_col2 = st.columns([3,1])
-        with del_col1:
-            st.caption("Tick the rows to delete, then press the button.")
-        with del_col2:
-            do_delete = st.button("🗑️ Delete selected", use_container_width=True, key="btn_staff_delete")
-
-        if do_delete:
-            to_delete_ids = edited_today.loc[edited_today["__delete__"] == True, "tx_id"].astype(str).tolist()
-            if not to_delete_ids:
-                st.warning("No rows ticked for deletion.")
-            else:
+        a1, a2 = st.columns([1,1])
+        with a1:
+            if st.button("💾 Save today's edits", key="btn_staff_save"):
                 master = st.session_state.transactions.copy()
                 master["tx_id"] = master.get("tx_id", pd.Series([None]*len(master))).astype(str)
-                before = len(master)
+
+                # Only update today's tx_id set
                 today_ids = set(df_today["tx_id"].astype(str).tolist())
-                to_delete_ids = [x for x in to_delete_ids if x in today_ids]  # safety: only today's rows
-                master = master[~master["tx_id"].isin(to_delete_ids)].reset_index(drop=True)
-                st.session_state.transactions = master
+                edited = edited_today.drop(columns=["__delete__"]).copy()
+                edited["date"] = pd.to_datetime(edited["date"], errors="coerce")
+                for c in ["hours","rental_revenue","snack_revenue"]:
+                    edited[c] = pd.to_numeric(edited[c], errors="coerce").fillna(0.0)
+                edited["payment_method"] = edited["payment_method"].astype(str).str.strip().str.title()
+                edited.loc[~edited["payment_method"].isin(PAYMENT_OPTIONS), "payment_method"] = "Cash"
+
+                ed_lookup = edited.set_index("tx_id")
+                mask = master["tx_id"].isin(today_ids)
+                # Map ONLY today's rows
+                for col in ["date","time_play","package","hours","rental_revenue","snack_type","snack_revenue","payment_method"]:
+                    master.loc[mask, col] = master.loc[mask, "tx_id"].map(ed_lookup[col])
+
+                st.session_state.transactions = master.reset_index(drop=True)
                 ensure_tx_ids()
                 autosave_all()
-                after = len(master)
-                st.success(f"Deleted {before - after} transaction(s).")
+                st.success("Today's changes saved.")
                 st.rerun()
+
+        with a2:
+            if st.button("🗑️ Delete ticked (today)", key="btn_staff_delete"):
+                to_del_ids = edited_today.loc[edited_today["__delete__"] == True, "tx_id"].astype(str).tolist()
+                if not to_del_ids:
+                    st.warning("No rows ticked for deletion.")
+                else:
+                    master = st.session_state.transactions.copy()
+                    master["tx_id"] = master.get("tx_id", pd.Series([None]*len(master))).astype(str)
+                    today_ids = set(df_today["tx_id"].astype(str).tolist())
+                    # only delete today's rows
+                    filtered = [x for x in to_del_ids if x in today_ids]
+                    before = len(master)
+                    master = master[~master["tx_id"].isin(filtered)].reset_index(drop=True)
+                    st.session_state.transactions = master
+                    ensure_tx_ids()
+                    autosave_all()
+                    after = len(master)
+                    st.success(f"Deleted {before - after} transaction(s).")
+                    st.rerun()
 
     if st.button("📥 Load Data", key="btn_staff_load"):
         ok = gs_load_transactions() or load_csv()
@@ -1061,13 +1085,14 @@ else:
             "rental_revenue": st.column_config.NumberColumn(step=1000, min_value=0),
             "snack_revenue": st.column_config.NumberColumn(step=1000, min_value=0),
             "time_play": st.column_config.TextColumn(help="24h HH:MM"),
-            "payment_method": st.column_config.TextColumn(help="Cash or QRIS"),
+            "payment_method": st.column_config.SelectboxColumn(options=PAYMENT_OPTIONS),
             "tx_id": st.column_config.TextColumn(disabled=True, help="Row ID (read-only)"),
         },
         key="tx_editor_inline",
     )
     edited_view["tx_id"] = edited_view["tx_id"].astype(str)
 
+    # Prepare labels for deletion chooser
     label_df = edited_view.copy()
     label_df["date"] = pd.to_datetime(label_df["date"], errors="coerce").dt.strftime("%Y-%m-%d").fillna("")
     label_df["label"] = (
