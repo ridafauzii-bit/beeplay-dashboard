@@ -2,7 +2,7 @@
 # Single-page layout, roles, inline edit/delete, CSV autosave + Google Sheets for:
 # - transactions (worksheet: "transactions")
 # - expenses (worksheet: "expenses")
-# - settings (targets, fixed costs, budgets, initial capital) (worksheet: "settings")
+# - settings (worksheet: "settings")
 #
 # Run locally:  python -m streamlit run app.py
 
@@ -10,7 +10,7 @@ import io
 import json
 import uuid
 import calendar
-from datetime import date, timedelta
+from datetime import date, timedelta, time, datetime
 from typing import Tuple, Dict, Optional
 
 import numpy as np
@@ -77,6 +77,8 @@ EXPENSE_CATEGORIES = [
     "Miscellaneous",
 ]
 
+PAYMENT_OPTIONS = ["Cash", "QRIS"]
+
 # ---------- HELPERS ----------
 def format_idr(x: float) -> str:
     try:
@@ -101,7 +103,7 @@ def excel_bytes(tx_df: pd.DataFrame, exp_df: pd.DataFrame, summary: Dict[str, fl
     output = io.BytesIO()
     with pd.ExcelWriter(output, engine="xlsxwriter") as writer:
         tx = tx_df.copy()
-        if not tx.empty and pd.api.types.is_datetime64_any_dtype(tx["date"]):
+        if "date" in tx.columns and pd.api.types.is_datetime64_any_dtype(tx["date"]):
             tx["date"] = tx["date"].dt.strftime("%Y-%m-%d")
         tx.to_excel(writer, sheet_name="Transactions", index=False)
 
@@ -139,11 +141,13 @@ def init_state():
     if "transactions" not in st.session_state:
         st.session_state.transactions = pd.DataFrame({
             "date": pd.to_datetime([], errors="coerce"),
+            "time_play": pd.Series([], dtype="object"),
             "package": pd.Series([], dtype="object"),
             "hours": pd.Series([], dtype="float"),
             "rental_revenue": pd.Series([], dtype="float"),
             "snack_type": pd.Series([], dtype="object"),
             "snack_revenue": pd.Series([], dtype="float"),
+            "payment_method": pd.Series([], dtype="object"),  # NEW
             "tx_id": pd.Series([], dtype="object"),
         })
     if "expenses" not in st.session_state:
@@ -165,7 +169,6 @@ def init_state():
             "fixed_costs": {"Rent": 0.0, "Salaries": 0.0, "Internet": 0.0, "Electricity": 0.0, "Misc": 0.0},
             "variable_per_hour": 0.0,
             "snack_cogs_pct": 40.0,
-            # monthly budgets by category
             "budgets": {cat: 0.0 for cat in EXPENSE_CATEGORIES},
         }
 
@@ -204,6 +207,10 @@ def load_csv(path="transactions.csv"):
         needed = ["date","package","hours","rental_revenue","snack_type","snack_revenue"]
         for c in needed:
             if c not in df.columns: return False
+        if "time_play" not in df.columns:
+            df["time_play"] = ""
+        if "payment_method" not in df.columns:   # NEW
+            df["payment_method"] = "Cash"
         if "tx_id" not in df.columns:
             df["tx_id"] = [str(uuid.uuid4()) for _ in range(len(df))]
         st.session_state.transactions = df
@@ -244,7 +251,6 @@ def load_settings_json(path="settings.json"):
     try:
         with open(path, "r", encoding="utf-8") as f:
             data = json.load(f)
-        # merge into config
         cfg = st.session_state.config
         for k, v in data.items():
             if k == "fixed_costs":
@@ -297,8 +303,15 @@ def add_sample_data():
             price = base * hrs
             snack_type = np.random.choice(snacks, p=[0.25,0.25,0.2,0.1,0.2])
             snack_rev = 0 if snack_type == "" else np.random.choice([5000, 10000, 15000], p=[0.5,0.35,0.15])
-            rows.append([d, pkg, float(hrs), float(price), snack_type, float(snack_rev), str(uuid.uuid4())])
-    df = pd.DataFrame(rows, columns=["date","package","hours","rental_revenue","snack_type","snack_revenue","tx_id"])
+            # random time within opening hours (assume 08:00–22:00)
+            rand_hour = int(np.random.randint(8, 22))
+            rand_min = int(np.random.choice([0, 15, 30, 45]))
+            time_play = f"{rand_hour:02d}:{rand_min:02d}"
+            pay = np.random.choice(PAYMENT_OPTIONS)
+            rows.append([d, time_play, pkg, float(hrs), float(price), snack_type, float(snack_rev), pay, str(uuid.uuid4())])
+    df = pd.DataFrame(rows, columns=[
+        "date","time_play","package","hours","rental_revenue","snack_type","snack_revenue","payment_method","tx_id"
+    ])
     st.session_state.transactions = df
     ensure_tx_ids()
 
@@ -323,11 +336,11 @@ def _gs_client():
     except Exception:
         return None
 
-def gs_open(sheet_name_key="sheets", default_ws="transactions"):
+def gs_open(section="sheets", default_ws="transactions"):
     gc = _gs_client()
     if not gc: return None, None
-    ss_id = st.secrets["sheets"]["spreadsheet_id"]
-    ws_name = st.secrets.get(sheet_name_key, {}).get("worksheet_name", default_ws)
+    ss_id = st.secrets["sheets"]["spreadsheet_id"]  # all 3 sections point to same spreadsheet
+    ws_name = st.secrets.get(section, {}).get("worksheet_name", default_ws)
     sh = gc.open_by_key(ss_id)
     ws = sh.worksheet(ws_name)
     return sh, ws
@@ -345,9 +358,19 @@ def gs_load_transactions() -> bool:
             return True
         df["date"] = pd.to_datetime(df["date"], errors="coerce")
         for c in ["hours","rental_revenue","snack_revenue"]:
-            df[c] = pd.to_numeric(df[c], errors="coerce").fillna(0.0)
-        df["package"] = df["package"].astype(str)
-        df["snack_type"] = df["snack_type"].astype(str)
+            if c in df.columns:
+                df[c] = pd.to_numeric(df[c], errors="coerce").fillna(0.0)
+        # ensure fields
+        for col, default, typ in [
+            ("package","",str),
+            ("snack_type","",str),
+            ("time_play","",str),
+            ("payment_method","Cash",str),  # NEW
+        ]:
+            if col not in df.columns:
+                df[col] = default
+            else:
+                df[col] = df[col].astype(typ)
         if "tx_id" not in df.columns:
             df["tx_id"] = [str(uuid.uuid4()) for _ in range(len(df))]
         st.session_state.transactions = df
@@ -363,7 +386,7 @@ def gs_save_transactions() -> bool:
         df = st.session_state.transactions.copy()
         if "date" in df.columns and pd.api.types.is_datetime64_any_dtype(df["date"]):
             df["date"] = df["date"].dt.strftime("%Y-%m-%d")
-        cols = ["date","package","hours","rental_revenue","snack_type","snack_revenue","tx_id"]
+        cols = ["date","time_play","package","hours","rental_revenue","snack_type","snack_revenue","payment_method","tx_id"]  # NEW includes payment_method
         for c in cols:
             if c not in df.columns: df[c] = ""
         df = df[cols]
@@ -661,8 +684,9 @@ def sidebar_settings(cfg):
 
 def upload_transactions_widget():
     st.markdown("### ⬆️ Upload Transactions (Excel/CSV)")
-    f = st.file_uploader("Choose .xlsx or .csv (date, package, hours, rental_revenue, snack_type, snack_revenue, [tx_id])",
-                         type=["xlsx","csv"], key="upl_tx")
+    f = st.file_uploader(
+        "Choose .xlsx or .csv (date, time_play [HH:MM optional], package, hours, rental_revenue, snack_type, snack_revenue, payment_method [Cash/QRIS optional], [tx_id])",
+        type=["xlsx","csv"], key="upl_tx")
     if f is not None:
         try:
             if f.name.lower().endswith(".xlsx"):
@@ -678,9 +702,21 @@ def upload_transactions_widget():
             df_new["date"] = pd.to_datetime(df_new["date"], errors="coerce")
             for col in ["hours","rental_revenue","snack_revenue"]:
                 df_new[col] = pd.to_numeric(df_new[col], errors="coerce").fillna(0.0)
+            # optional columns
+            if "time_play" not in df_new.columns:
+                df_new["time_play"] = ""
+            else:
+                df_new["time_play"] = df_new["time_play"].astype(str)
+            if "payment_method" not in df_new.columns:
+                df_new["payment_method"] = "Cash"
+            else:
+                df_new["payment_method"] = df_new["payment_method"].astype(str)
+                # normalize
+                df_new["payment_method"] = df_new["payment_method"].str.strip().str.title()
+                df_new.loc[~df_new["payment_method"].isin(PAYMENT_OPTIONS), "payment_method"] = "Cash"
             if "tx_id" not in df_new.columns:
                 df_new["tx_id"] = [str(uuid.uuid4()) for _ in range(len(df_new))]
-            cols = ["date","package","hours","rental_revenue","snack_type","snack_revenue","tx_id"]
+            cols = ["date","time_play","package","hours","rental_revenue","snack_type","snack_revenue","payment_method","tx_id"]
             st.session_state.transactions = pd.concat([st.session_state.transactions, df_new[cols]], ignore_index=True)
             ensure_tx_ids()
             autosave_all()
@@ -720,29 +756,33 @@ def upload_expenses_widget():
 
 def add_transaction_form():
     with st.expander("Add Transaction (manual entry)", expanded=True):
-        col1, col2, col3, col4, col5, col6 = st.columns([1.6,1.6,1.1,1.6,1.6,1.2])
-        # unique keys
+        col1, col2, col3, col4, col5, col6, col7, col8 = st.columns([1.15,1.15,1.0,1.25,1.25,1.0,1.0,1.0])
         t_date = col1.date_input("Date", value=date.today(), key="tx_date")
-        t_package = col2.text_input("Package (e.g., PS5-2h)", key="tx_pkg")
-        t_hours = float(col3.number_input("Hours", min_value=0.0, max_value=24.0, value=1.0, step=0.5, key="tx_hours"))
-        t_rental = float(col4.number_input("Rental revenue (IDR)", min_value=0, value=0, step=1000, key="tx_rent"))
-        t_snack_type = col5.text_input("Snack type (e.g., Soda)", key="tx_snack_type")
-        t_snack = float(col6.number_input("Snack revenue (IDR)", min_value=0, value=0, step=1000, key="tx_snack"))
+        default_time = (datetime.now()).time().replace(second=0, microsecond=0)
+        t_time = col2.time_input("Time Play (24h)", value=default_time, key="tx_time")
+        t_package = col3.text_input("Package", key="tx_pkg")
+        t_hours = float(col4.number_input("Hours", min_value=0.0, max_value=24.0, value=1.0, step=0.5, key="tx_hours"))
+        t_rental = float(col5.number_input("Rental revenue (IDR)", min_value=0, value=0, step=1000, key="tx_rent"))
+        t_snack_type = col6.text_input("Snack type", key="tx_snack_type")
+        t_snack = float(col7.number_input("Snack revenue (IDR)", min_value=0, value=0, step=1000, key="tx_snack"))
+        t_payment = col8.selectbox("Payment", PAYMENT_OPTIONS, index=0, key="tx_payment")
         b1, b2, _ = st.columns([1,1,6])
         if b1.button("➕ Add Transaction", key="btn_add_tx"):
             new_row = pd.DataFrame({
                 "date":[pd.to_datetime(t_date)],
+                "time_play":[t_time.strftime("%H:%M")],
                 "package":[t_package],
                 "hours":[t_hours],
                 "rental_revenue":[t_rental],
                 "snack_type":[t_snack_type],
                 "snack_revenue":[t_snack],
+                "payment_method":[t_payment],
                 "tx_id":[str(uuid.uuid4())],
             })
             st.session_state.transactions = pd.concat([st.session_state.transactions, new_row], ignore_index=True)
             ensure_tx_ids()
             autosave_all()
-            st.success("Transaction added.")
+            st.success("Transaction added & saved.")
         if b2.button("🧹 Clear Form", key="btn_clear_tx"):
             st.rerun()
 
@@ -750,7 +790,6 @@ def add_expense_form(role_is_team: bool):
     disabled = not role_is_team
     with st.expander("Add Expense (manual entry)", expanded=False):
         r1c1, r1c2, r1c3 = st.columns([1.2,1.6,1.2])
-        # unique keys
         e_date = r1c1.date_input("Date", value=date.today(), disabled=disabled, key="exp_date")
         e_category = r1c2.selectbox("Category", EXPENSE_CATEGORIES, disabled=disabled, key="exp_cat")
         e_amount = float(r1c3.number_input("Amount (IDR)", min_value=0, value=0, step=1000, disabled=disabled, key="exp_amt"))
@@ -796,7 +835,7 @@ if role == "staff":
             st.success("Logged out.")
             st.rerun()
 
-    st.info("**Staff Mode** — input transactions & upload files. Only today's records are shown. Expenses are hidden for staff.")
+    st.info("**Staff Mode** — input and delete **today's** transactions. Expenses are hidden for staff.")
     add_transaction_form()
     upload_transactions_widget()
 
@@ -808,33 +847,69 @@ if role == "staff":
 
     view_today = df_today.sort_values("date", ascending=False).copy()
     if not view_today.empty:
-        # Format columns safely
         view_today["date"] = pd.to_datetime(view_today["date"], errors="coerce").dt.strftime("%Y-%m-%d")
+        view_today["hours"] = pd.to_numeric(view_today["hours"], errors="coerce").round(2)
         view_today["rental_revenue"] = pd.to_numeric(view_today["rental_revenue"], errors="coerce").fillna(0).map(format_idr)
         view_today["snack_revenue"] = pd.to_numeric(view_today["snack_revenue"], errors="coerce").fillna(0).map(format_idr)
-        view_today["hours"] = pd.to_numeric(view_today["hours"], errors="coerce").round(2)
+        if "payment_method" not in view_today.columns:
+            view_today["payment_method"] = "Cash"
 
-    st.dataframe(view_today, use_container_width=True)
+    cols_today = ["date","time_play","package","hours","rental_revenue","snack_type","snack_revenue","payment_method","tx_id"]
+    st.dataframe(view_today[cols_today] if not view_today.empty else view_today, use_container_width=True)
 
-    # Staff quick save/load
-    c1, c2 = st.columns(2)
-    with c1:
-        if st.button("📤 Save Data", key="btn_staff_save"):
-            ok = gs_save_transactions() or save_csv()
-            if ok: st.success("Saved")
-            else: st.error("Failed to save")
-    with c2:
-        if st.button("📥 Load Data", key="btn_staff_load"):
-            ok = gs_load_transactions() or load_csv()
-            if ok: st.success("Loaded")
-            else: st.error("Failed to load")
+    # Staff DELETE today's transactions (no edit)
+    if not view_today.empty:
+        label_df = view_today.copy()
+        # reverse the currency back to int only for the label
+        tmp_val = pd.to_numeric(
+            label_df["rental_revenue"].astype(str).str.replace("Rp","").str.replace(".",""),
+            errors="coerce"
+        ).fillna(0).astype(int).astype(str)
+        label_df["label"] = (
+            label_df["date"].astype(str) + " " +
+            label_df["time_play"].astype(str) + " | " +
+            label_df["package"].astype(str) + " | " +
+            label_df["payment_method"].astype(str) + " | Rp" +
+            tmp_val + " | ID:" + label_df["tx_id"].astype(str).str[-6:]
+        )
+        choices = {row["label"]: row["tx_id"] for _, row in label_df.iterrows()}
+
+        d1, d2 = st.columns([3,1])
+        with d1:
+            to_del = st.multiselect("Select today’s transaction(s) to delete", options=list(choices.keys()), key="staff_del_multisel")
+        with d2:
+            st.write("")
+            del_click = st.button("🗑️ Delete selected", use_container_width=True, key="btn_staff_delete")
+
+        if del_click:
+            if not to_del:
+                st.warning("No rows selected.")
+            else:
+                del_ids = {str(choices[label]) for label in to_del if label in choices}
+                master = st.session_state.transactions.copy()
+                master["tx_id"] = master.get("tx_id", pd.Series([None]*len(master))).astype(str)
+                before = len(master)
+                master = master[~master["tx_id"].isin(del_ids)].reset_index(drop=True)
+                st.session_state.transactions = master
+                ensure_tx_ids()
+                autosave_all()
+                after = len(master)
+                st.success(f"Deleted {before - after} transaction(s).")
+                st.rerun()
+
+    # Staff menu: only Load (autosaves happen on add/delete)
+    if st.button("📥 Load Data", key="btn_staff_load"):
+        ok = gs_load_transactions() or load_csv()
+        if ok: st.success("Loaded")
+        else: st.error("Failed to load")
+
     st.stop()
 
 # ---------- TEAM VIEW (full dashboard) ----------
 # Sidebar settings (includes settings persistence buttons)
 sidebar_settings(cfg)
 
-# Period filters (unique keys)
+# Period filters
 colf = st.columns([2,2,2,4])
 with colf[0]:
     period = st.selectbox("Period", ["Today","This Week","This Month","This Quarter","This Year","Custom Range"], index=2, key="period_sel")
@@ -947,7 +1022,6 @@ mo_start, mo_end = start_end_of_month(ref_date)
 cat_month = monthly_expense_by_category(exp_all, mo_start, mo_end)
 if not cat_month.empty:
     st.subheader(f"📅 Budget Status • {mo_start} → {mo_end}")
-    # Build table compare to budgets
     budget_rows = []
     for _, r in cat_month.iterrows():
         cat = r["category"]; spent = float(r["amount"]); budget = float(cfg["budgets"].get(cat, 0.0))
@@ -957,7 +1031,6 @@ if not cat_month.empty:
             if ratio >= 1.0: status = "Over"
             elif ratio >= 0.9: status = "Near"
         budget_rows.append({"Category": cat, "Spent": spent, "Budget": budget, "Status": status})
-    # also include categories with budget but no spend
     for cat, budget in cfg["budgets"].items():
         if cat not in cat_month["category"].tolist() and budget > 0:
             budget_rows.append({"Category": cat, "Spent": 0.0, "Budget": budget, "Status": "Under"})
@@ -968,18 +1041,19 @@ if not cat_month.empty:
 
 st.divider()
 
-# ================== Transactions (in range) — EDIT & DELETE ==================
+# ================== Transactions (in range) — EDIT & DELETE (TEAM) ==================
 st.subheader("🧾 Transactions (in range) — edit & delete (Team)")
 
 if df_range.empty:
     st.info("No transactions in the selected range.")
 else:
-    view_cols = ["date","package","hours","rental_revenue","snack_type","snack_revenue","tx_id"]
+    view_cols = ["date","time_play","package","hours","rental_revenue","snack_type","snack_revenue","payment_method","tx_id"]
     view = df_range[view_cols].copy()
     view["date"] = pd.to_datetime(view["date"], errors="coerce").dt.date
     for c in ["hours","rental_revenue","snack_revenue"]:
         view[c] = pd.to_numeric(view[c], errors="coerce")
     editable = (role == "team")
+    # Use TextColumn for payment to ensure compatibility; we validate values on save
     edited_view = st.data_editor(
         view.sort_values("date", ascending=False),
         use_container_width=True,
@@ -990,6 +1064,8 @@ else:
             "hours": st.column_config.NumberColumn(step=0.5, min_value=0.0),
             "rental_revenue": st.column_config.NumberColumn(step=1000, min_value=0),
             "snack_revenue": st.column_config.NumberColumn(step=1000, min_value=0),
+            "time_play": st.column_config.TextColumn(help="24h HH:MM"),
+            "payment_method": st.column_config.TextColumn(help="Cash or QRIS"),
             "tx_id": st.column_config.TextColumn(disabled=True, help="Row ID (read-only)"),
         },
         key="tx_editor_inline",
@@ -999,7 +1075,13 @@ else:
     # Delete choices
     label_df = edited_view.copy()
     label_df["date"] = pd.to_datetime(label_df["date"], errors="coerce").dt.strftime("%Y-%m-%d").fillna("")
-    label_df["label"] = label_df["date"] + " | " + label_df["package"].astype(str) + " | Rp" + label_df["rental_revenue"].fillna(0).astype(int).astype(str) + " | ID:" + label_df["tx_id"].str[-6:]
+    label_df["label"] = (
+        label_df["date"] + " " + label_df["time_play"].astype(str) +
+        " | " + label_df["package"].astype(str) +
+        " | " + label_df["payment_method"].astype(str) +
+        " | Rp" + label_df["rental_revenue"].fillna(0).astype(int).astype(str) +
+        " | ID:" + label_df["tx_id"].str[-6:]
+    )
     del_choices = {row["label"]: row["tx_id"] for _, row in label_df.iterrows()}
 
     dcol1, dcol2 = st.columns([3, 1])
@@ -1017,9 +1099,12 @@ else:
         edited["date"] = pd.to_datetime(edited["date"], errors="coerce")
         for c in ["hours","rental_revenue","snack_revenue"]:
             edited[c] = pd.to_numeric(edited[c], errors="coerce")
+        # normalize payment_method
+        edited["payment_method"] = edited["payment_method"].astype(str).str.strip().str.title()
+        edited.loc[~edited["payment_method"].isin(PAYMENT_OPTIONS), "payment_method"] = "Cash"
         ed_lookup = edited.set_index("tx_id")
         mask = master["tx_id"].isin(ed_lookup.index)
-        for col in ["date","package","hours","rental_revenue","snack_type","snack_revenue"]:
+        for col in ["date","time_play","package","hours","rental_revenue","snack_type","snack_revenue","payment_method"]:
             master.loc[mask, col] = master.loc[mask, "tx_id"].map(ed_lookup[col])
         st.session_state.transactions = master.reset_index(drop=True)
         ensure_tx_ids()
