@@ -10,7 +10,7 @@ import io
 import json
 import uuid
 import calendar
-from datetime import date, timedelta, time, datetime
+from datetime import date, timedelta, datetime
 from typing import Tuple, Dict, Optional
 
 import numpy as np
@@ -302,7 +302,6 @@ def add_sample_data():
             price = base * hrs
             snack_type = np.random.choice(snacks, p=[0.25,0.25,0.2,0.1,0.2])
             snack_rev = 0 if snack_type == "" else np.random.choice([5000, 10000, 15000], p=[0.5,0.35,0.15])
-            # random time within opening hours (assume 08:00–22:00)
             rand_hour = int(np.random.randint(8, 22))
             rand_min = int(np.random.choice([0, 15, 30, 45]))
             time_play = f"{rand_hour:02d}:{rand_min:02d}"
@@ -314,7 +313,6 @@ def add_sample_data():
     st.session_state.transactions = df
     ensure_tx_ids()
 
-    # Optional: a few random expenses
     erows = []
     for d in rng:
         if np.random.rand() < 0.5:
@@ -338,7 +336,7 @@ def _gs_client():
 def gs_open(section="sheets", default_ws="transactions"):
     gc = _gs_client()
     if not gc: return None, None
-    ss_id = st.secrets["sheets"]["spreadsheet_id"]  # all 3 sections point to same spreadsheet
+    ss_id = st.secrets["sheets"]["spreadsheet_id"]
     ws_name = st.secrets.get(section, {}).get("worksheet_name", default_ws)
     sh = gc.open_by_key(ss_id)
     ws = sh.worksheet(ws_name)
@@ -359,7 +357,6 @@ def gs_load_transactions() -> bool:
         for c in ["hours","rental_revenue","snack_revenue"]:
             if c in df.columns:
                 df[c] = pd.to_numeric(df[c], errors="coerce").fillna(0.0)
-        # ensure fields
         for col, default, typ in [
             ("package","",str),
             ("snack_type","",str),
@@ -446,7 +443,7 @@ def gs_load_settings() -> bool:
         if not ws: return False
         rows = ws.get_all_records()
         if not rows:
-            return True  # nothing to load yet
+            return True
         kv = {r.get("key"): r.get("value") for r in rows if "key" in r and "value" in r}
         cfg = st.session_state.config
 
@@ -459,19 +456,16 @@ def gs_load_settings() -> bool:
             except Exception:
                 return v
 
-        # simple keys
         for simple in ["brand","num_consoles","open_hours","initial_capital","weekly_target_revenue","monthly_target_revenue","variable_per_hour","snack_cogs_pct"]:
             if simple in kv:
                 val = to_num(kv[simple])
                 cfg[simple] = val if isinstance(val, float) else kv[simple]
 
-        # fixed costs
         for fc in ["Rent","Salaries","Internet","Electricity","Misc"]:
             key = f"fixed_{fc}"
             if key in kv:
                 cfg["fixed_costs"][fc] = to_num(kv[key])
 
-        # budgets
         for cat in EXPENSE_CATEGORIES:
             bkey = f"budget_{cat}"
             if bkey in kv:
@@ -516,14 +510,12 @@ def gs_save_settings() -> bool:
 
 # ---------- Autosave everything ----------
 def autosave_all():
-    # CSV backups
     try: st.session_state.transactions.to_csv("transactions.csv", index=False)
     except Exception: pass
     try: st.session_state.expenses.to_csv("expenses.csv", index=False)
     except Exception: pass
     try: save_settings_json("settings.json")
     except Exception: pass
-    # Google Sheets
     try: gs_save_transactions()
     except Exception: pass
     try: gs_save_expenses()
@@ -544,20 +536,17 @@ def kpis_for_range_income(df_income: pd.DataFrame, cfg: dict, start: date, end: 
     hours_total = df_income["hours"].sum() if not df_income.empty else 0.0
     tx_count = len(df_income)
 
-    # Utilization (planning capacity)
     days = (end - start).days + 1
     available_hours = cfg["num_consoles"] * cfg["open_hours"] * max(days, 1)
     utilization = (hours_total / available_hours * 100.0) if available_hours > 0 else 0.0
     utilization = min(utilization, 100.0)
 
-    # Contribution Margin Ratio (planning)
     variable_from_hours = cfg["variable_per_hour"] * hours_total
     variable_from_snacks = (cfg["snack_cogs_pct"]/100.0) * snack_rev
     variable_total_planning = variable_from_hours + variable_from_snacks
     cm = total_rev - variable_total_planning
     cmr = (cm / total_rev) if total_rev > 0 else 0.0
 
-    # Fixed monthly costs (planning)
     monthly_fixed_total = sum(cfg["fixed_costs"].values())
     bep_revenue_monthly = (monthly_fixed_total / cmr) if cmr > 0 else None
 
@@ -640,7 +629,6 @@ def sidebar_settings(cfg):
         st.markdown("### 🧩 Budgets (monthly per category)")
         for cat in EXPENSE_CATEGORIES:
             cfg["budgets"][cat] = float(st.number_input(f"Budget • {cat}", 0, 5_000_000_000, int(cfg["budgets"].get(cat, 0)), key=f"bud_{cat}"))
-        ensure_budget_keys()
 
         st.divider()
         st.markdown("### 💾 Data")
@@ -698,10 +686,12 @@ def upload_transactions_widget():
             if missing:
                 st.error(f"Missing columns in file: {missing}")
                 return
-            df_new["date"] = pd.to_datetime(df_new["date"], errors="coerce")
+            df_new["date"] = pd.to_datetime(df_new["date"], errors="coerce", infer_datetime_format=True)
+            # if most failed, try dayfirst parsing (DD/MM/YYYY)
+            if df_new["date"].isna().mean() > 0.5:
+                df_new["date"] = pd.to_datetime(df_new["date"], errors="coerce", dayfirst=True, infer_datetime_format=True)
             for col in ["hours","rental_revenue","snack_revenue"]:
                 df_new[col] = pd.to_numeric(df_new[col], errors="coerce").fillna(0.0)
-            # optional columns
             if "time_play" not in df_new.columns:
                 df_new["time_play"] = ""
             else:
@@ -718,7 +708,7 @@ def upload_transactions_widget():
             ensure_tx_ids()
             autosave_all()
             st.success(f"Imported {len(df_new)} rows.")
-            st.rerun()  # ensure staff/any view refreshes after upload
+            st.rerun()  # refresh immediately
         except Exception as e:
             st.error(f"Failed to read file: {e}")
 
@@ -738,7 +728,9 @@ def upload_expenses_widget():
             if missing:
                 st.error(f"Missing columns in file: {missing}")
                 return
-            df_new["date"] = pd.to_datetime(df_new["date"], errors="coerce")
+            df_new["date"] = pd.to_datetime(df_new["date"], errors="coerce", infer_datetime_format=True)
+            if df_new["date"].isna().mean() > 0.5:
+                df_new["date"] = pd.to_datetime(df_new["date"], errors="coerce", dayfirst=True, infer_datetime_format=True)
             df_new["amount"] = pd.to_numeric(df_new["amount"], errors="coerce").fillna(0.0)
             df_new["category"] = df_new["category"].astype(str)
             df_new["description"] = df_new["description"].astype(str)
@@ -781,7 +773,7 @@ def add_transaction_form():
             ensure_tx_ids()
             autosave_all()
             st.success("Transaction added & saved.")
-            st.rerun()  # ensure staff "today" list updates instantly
+            st.rerun()  # show in staff "today" immediately
         if b2.button("🧹 Clear Form", key="btn_clear_tx"):
             st.rerun()
 
@@ -838,32 +830,32 @@ if role == "staff":
     add_transaction_form()
     upload_transactions_widget()
 
-    # robust today's filter
-    df_today = st.session_state.transactions.copy()
-if not df_today.empty:
-    # 1) Parse dates robustly (try ISO first, then day-first)
-    d0 = pd.to_datetime(df_today["date"], errors="coerce", infer_datetime_format=True)
-    if d0.isna().mean() > 0.5:
-        d0 = pd.to_datetime(df_today["date"], errors="coerce", dayfirst=True, infer_datetime_format=True)
-    df_today["__date_dt"] = d0
-
-    # 2) Keep rows that successfully parsed
-    df_today = df_today[~df_today["__date_dt"].isna()].copy()
-
-    # 3) Compare by calendar date (no time)
-    df_today["__date_only"] = df_today["__date_dt"].dt.date
-    df_today = df_today[df_today["__date_only"] == date.today()].copy()
-
-    # 4) Use the parsed column as the display date
-    df_today["date"] = df_today["__date_dt"]
-
-
     st.subheader("🧾 Today's Transactions")
+
+    # ===== Robust TODAY filter (handles ISO, DD/MM/YYYY, strings, datetimes) =====
+    df_today = st.session_state.transactions.copy()
+    if not df_today.empty:
+        # 1) try default/infer
+        d0 = pd.to_datetime(df_today["date"], errors="coerce", infer_datetime_format=True)
+        # 2) if majority failed, try day-first (31/08/2025)
+        if d0.isna().mean() > 0.5:
+            d0 = pd.to_datetime(df_today["date"], errors="coerce", dayfirst=True, infer_datetime_format=True)
+        df_today["__date_dt"] = d0
+        df_today = df_today[~df_today["__date_dt"].isna()].copy()
+        df_today["__date_only"] = df_today["__date_dt"].dt.date
+        df_today = df_today[df_today["__date_only"] == date.today()].copy()
+        # Use parsed date for display
+        df_today["date"] = df_today["__date_dt"]
+
+    # ---- Debug block (remove later if you want) ----
+    st.caption("Debug: last 5 raw rows in session_state.transactions")
+    if not st.session_state.transactions.empty:
+        st.write(st.session_state.transactions.tail()[["date","time_play","package","payment_method"]])
 
     if df_today.empty:
         st.info("No transactions for today yet.")
     else:
-        view_today = df_today.sort_values("date", ascending=False).copy()
+        view_today = df_today.sort_values("__date_dt", ascending=False).copy()
         view_today["date"] = pd.to_datetime(view_today["date"], errors="coerce").dt.strftime("%Y-%m-%d")
         view_today["hours"] = pd.to_numeric(view_today["hours"], errors="coerce").round(2)
         view_today["rental_revenue"] = pd.to_numeric(view_today["rental_revenue"], errors="coerce").fillna(0).map(format_idr)
@@ -875,7 +867,6 @@ if not df_today.empty:
 
         # Staff DELETE today's transactions (no edit)
         label_df = view_today.copy()
-        # create numeric for label from formatted rent
         tmp_val = pd.to_numeric(
             label_df["rental_revenue"].astype(str).str.replace("Rp","").str.replace(".",""),
             errors="coerce"
@@ -912,7 +903,6 @@ if not df_today.empty:
                 st.success(f"Deleted {before - after} transaction(s).")
                 st.rerun()
 
-    # Staff menu: only Load (autosaves happen on add/delete)
     if st.button("📥 Load Data", key="btn_staff_load"):
         ok = gs_load_transactions() or load_csv()
         if ok: st.success("Loaded")
@@ -921,7 +911,6 @@ if not df_today.empty:
     st.stop()
 
 # ---------- TEAM VIEW (full dashboard) ----------
-# Sidebar settings (includes settings persistence buttons)
 sidebar_settings(cfg)
 
 # Period filters
@@ -957,16 +946,12 @@ df_range = filter_by_range(df_all, start, end)
 exp_all = st.session_state.expenses
 exp_range = filter_by_range(exp_all, start, end)
 
-# KPIs: income side
+# KPIs
 k = kpis_for_range_income(df_range, cfg, start, end)
-# Outcome + net cashflow
 exp_sum = expenses_sum_in_range(exp_range)
 net_cashflow = k["total_revenue"] - exp_sum
-
-# All-time ROI (income - expenses)
 cumul_net, roi_pct = cumulative_net_profit_including_expenses(cfg)
 
-# KPI rows
 c1, c2, c3, c4, c5 = st.columns(5)
 c1.metric("Total Revenue", format_idr(k["total_revenue"]))
 c2.metric("Snack Sales", format_idr(k["snack_revenue"]))
@@ -979,7 +964,6 @@ c6.metric("Expenses (Outcome)", format_idr(exp_sum))
 c7.metric("Net Cashflow (Income − Outcome)", format_idr(net_cashflow))
 c8.metric("ROI % (all-time, incl. expenses)", f"{roi_pct:.2f}%")
 
-# Progress vs targets
 with st.expander("📊 Progress vs Targets (weekly & monthly)", expanded=False):
     wk_start, wk_end = start_end_of_week(ref_date)
     df_wk = filter_by_range(df_all, wk_start, wk_end)
@@ -995,7 +979,7 @@ with st.expander("📊 Progress vs Targets (weekly & monthly)", expanded=False):
     st.write(f"**This Month ({mo_start} → {mo_end})**  |  Revenue: {format_idr(rev_month)}  |  Target: {format_idr(monthly_target)}")
     st.progress(min(rev_month/monthly_target, 1.0))
 
-# Charts row
+# Charts
 left, right = st.columns([3,2])
 with left:
     st.subheader("📈 Daily Revenue Trend")
@@ -1019,7 +1003,6 @@ with right:
         ax.axis('equal')
         st.pyplot(fig)
 
-# Income vs Outcome bar
 with st.expander("📊 Income vs Outcome (this period)", expanded=True):
     cmp_df = pd.DataFrame({
         "label": ["Income (Revenue)", "Outcome (Expenses)"],
@@ -1027,12 +1010,10 @@ with st.expander("📊 Income vs Outcome (this period)", expanded=True):
     }).set_index("label")
     st.bar_chart(cmp_df)
 
-# Expenses by Category for the period
 with st.expander("🧮 Expenses by Category (this period)", expanded=False):
     by_cat = exp_range.groupby("category", as_index=False)["amount"].sum().sort_values("amount", ascending=False) if not exp_range.empty else pd.DataFrame(columns=["category","amount"])
     st.dataframe(by_cat, use_container_width=True)
 
-# Monthly budget status (for month of ref_date)
 mo_start, mo_end = start_end_of_month(ref_date)
 cat_month = monthly_expense_by_category(exp_all, mo_start, mo_end)
 if not cat_month.empty:
@@ -1068,7 +1049,6 @@ else:
     for c in ["hours","rental_revenue","snack_revenue"]:
         view[c] = pd.to_numeric(view[c], errors="coerce")
     editable = (role == "team")
-    # Use TextColumn for payment to ensure compatibility; we validate values on save
     edited_view = st.data_editor(
         view.sort_values("date", ascending=False),
         use_container_width=True,
@@ -1087,7 +1067,6 @@ else:
     )
     edited_view["tx_id"] = edited_view["tx_id"].astype(str)
 
-    # Delete choices
     label_df = edited_view.copy()
     label_df["date"] = pd.to_datetime(label_df["date"], errors="coerce").dt.strftime("%Y-%m-%d").fillna("")
     label_df["label"] = (
@@ -1114,7 +1093,6 @@ else:
         edited["date"] = pd.to_datetime(edited["date"], errors="coerce")
         for c in ["hours","rental_revenue","snack_revenue"]:
             edited[c] = pd.to_numeric(edited[c], errors="coerce")
-        # normalize payment_method
         edited["payment_method"] = edited["payment_method"].astype(str).str.strip().str.title()
         edited.loc[~edited["payment_method"].isin(PAYMENT_OPTIONS), "payment_method"] = "Cash"
         ed_lookup = edited.set_index("tx_id")
@@ -1143,7 +1121,7 @@ else:
             st.success(f"Deleted {before - after} transaction(s).")
             st.rerun()
 
-# Input & Upload (Income)
+# Income input/upload (team area too)
 st.markdown("### ➕ Add / Upload (Income)")
 add_transaction_form()
 upload_transactions_widget()
@@ -1236,7 +1214,6 @@ summary_export = {
     "CM Ratio (%) (plan)": round(float(k["cmr"])*100.0, 2),
     "BEP Revenue (Monthly, plan)": int(k["bep_revenue_monthly"]) if k["bep_revenue_monthly"] is not None else "N/A",
 }
-# Top expense categories (this period)
 if not exp_range.empty:
     top5 = exp_range.groupby("category", as_index=False)["amount"].sum().sort_values("amount", ascending=False).head(5)
     for i, row in top5.iterrows():
@@ -1257,5 +1234,3 @@ with coly:
 
 st.markdown("---")
 st.markdown("**Notes**: Income = rental + snack sales. Expenses are recorded in the Expenses section. BEP & CM use planning inputs (fixed costs & variable settings). ROI includes actual expenses.")
-
-
