@@ -76,7 +76,6 @@ EXPENSE_CATEGORIES = [
     "Bank Fees",
     "Miscellaneous",
 ]
-
 PAYMENT_OPTIONS = ["Cash", "QRIS"]
 
 # ---------- HELPERS ----------
@@ -147,7 +146,7 @@ def init_state():
             "rental_revenue": pd.Series([], dtype="float"),
             "snack_type": pd.Series([], dtype="object"),
             "snack_revenue": pd.Series([], dtype="float"),
-            "payment_method": pd.Series([], dtype="object"),  # NEW
+            "payment_method": pd.Series([], dtype="object"),
             "tx_id": pd.Series([], dtype="object"),
         })
     if "expenses" not in st.session_state:
@@ -209,7 +208,7 @@ def load_csv(path="transactions.csv"):
             if c not in df.columns: return False
         if "time_play" not in df.columns:
             df["time_play"] = ""
-        if "payment_method" not in df.columns:   # NEW
+        if "payment_method" not in df.columns:
             df["payment_method"] = "Cash"
         if "tx_id" not in df.columns:
             df["tx_id"] = [str(uuid.uuid4()) for _ in range(len(df))]
@@ -365,7 +364,7 @@ def gs_load_transactions() -> bool:
             ("package","",str),
             ("snack_type","",str),
             ("time_play","",str),
-            ("payment_method","Cash",str),  # NEW
+            ("payment_method","Cash",str),
         ]:
             if col not in df.columns:
                 df[col] = default
@@ -386,7 +385,7 @@ def gs_save_transactions() -> bool:
         df = st.session_state.transactions.copy()
         if "date" in df.columns and pd.api.types.is_datetime64_any_dtype(df["date"]):
             df["date"] = df["date"].dt.strftime("%Y-%m-%d")
-        cols = ["date","time_play","package","hours","rental_revenue","snack_type","snack_revenue","payment_method","tx_id"]  # NEW includes payment_method
+        cols = ["date","time_play","package","hours","rental_revenue","snack_type","snack_revenue","payment_method","tx_id"]
         for c in cols:
             if c not in df.columns: df[c] = ""
         df = df[cols]
@@ -433,7 +432,7 @@ def gs_save_expenses() -> bool:
             if c not in df.columns: df[c] = ""
         df = df[cols]
         ws.clear()
-        ws.append_row(cols)
+        ws.append_row(["date","category","description","amount","exp_id"])
         if len(df) > 0:
             ws.append_rows(df.values.tolist())
         return True
@@ -710,9 +709,7 @@ def upload_transactions_widget():
             if "payment_method" not in df_new.columns:
                 df_new["payment_method"] = "Cash"
             else:
-                df_new["payment_method"] = df_new["payment_method"].astype(str)
-                # normalize
-                df_new["payment_method"] = df_new["payment_method"].str.strip().str.title()
+                df_new["payment_method"] = df_new["payment_method"].astype(str).str.strip().str.title()
                 df_new.loc[~df_new["payment_method"].isin(PAYMENT_OPTIONS), "payment_method"] = "Cash"
             if "tx_id" not in df_new.columns:
                 df_new["tx_id"] = [str(uuid.uuid4()) for _ in range(len(df_new))]
@@ -721,6 +718,7 @@ def upload_transactions_widget():
             ensure_tx_ids()
             autosave_all()
             st.success(f"Imported {len(df_new)} rows.")
+            st.rerun()  # ensure staff/any view refreshes after upload
         except Exception as e:
             st.error(f"Failed to read file: {e}")
 
@@ -783,6 +781,7 @@ def add_transaction_form():
             ensure_tx_ids()
             autosave_all()
             st.success("Transaction added & saved.")
+            st.rerun()  # ensure staff "today" list updates instantly
         if b2.button("🧹 Clear Form", key="btn_clear_tx"):
             st.rerun()
 
@@ -839,28 +838,31 @@ if role == "staff":
     add_transaction_form()
     upload_transactions_widget()
 
+    # robust today's filter
     df_today = st.session_state.transactions.copy()
     if not df_today.empty:
-        df_today = df_today[df_today["date"].dt.date == date.today()]
+        df_today["date"] = pd.to_datetime(df_today["date"], errors="coerce")
+        today_dt = pd.to_datetime(date.today())
+        df_today = df_today[df_today["date"].dt.normalize() == today_dt]
 
     st.subheader("🧾 Today's Transactions")
 
-    view_today = df_today.sort_values("date", ascending=False).copy()
-    if not view_today.empty:
+    if df_today.empty:
+        st.info("No transactions for today yet.")
+    else:
+        view_today = df_today.sort_values("date", ascending=False).copy()
         view_today["date"] = pd.to_datetime(view_today["date"], errors="coerce").dt.strftime("%Y-%m-%d")
         view_today["hours"] = pd.to_numeric(view_today["hours"], errors="coerce").round(2)
         view_today["rental_revenue"] = pd.to_numeric(view_today["rental_revenue"], errors="coerce").fillna(0).map(format_idr)
         view_today["snack_revenue"] = pd.to_numeric(view_today["snack_revenue"], errors="coerce").fillna(0).map(format_idr)
         if "payment_method" not in view_today.columns:
             view_today["payment_method"] = "Cash"
+        cols_today = ["date","time_play","package","hours","rental_revenue","snack_type","snack_revenue","payment_method","tx_id"]
+        st.dataframe(view_today[cols_today], use_container_width=True)
 
-    cols_today = ["date","time_play","package","hours","rental_revenue","snack_type","snack_revenue","payment_method","tx_id"]
-    st.dataframe(view_today[cols_today] if not view_today.empty else view_today, use_container_width=True)
-
-    # Staff DELETE today's transactions (no edit)
-    if not view_today.empty:
+        # Staff DELETE today's transactions (no edit)
         label_df = view_today.copy()
-        # reverse the currency back to int only for the label
+        # create numeric for label from formatted rent
         tmp_val = pd.to_numeric(
             label_df["rental_revenue"].astype(str).str.replace("Rp","").str.replace(".",""),
             errors="coerce"
