@@ -840,12 +840,29 @@ if role == "staff":
 
     # robust today's filter
     df_today = st.session_state.transactions.copy()
-    if not df_today.empty:
-        df_today["date"] = pd.to_datetime(df_today["date"], errors="coerce")
-        today_dt = pd.to_datetime(date.today())
-        df_today = df_today[df_today["date"].dt.normalize() == today_dt]
+if not df_today.empty:
+    # 1) Parse dates robustly (try ISO first, then day-first)
+    d0 = pd.to_datetime(df_today["date"], errors="coerce", infer_datetime_format=True)
+    if d0.isna().mean() > 0.5:
+        d0 = pd.to_datetime(df_today["date"], errors="coerce", dayfirst=True, infer_datetime_format=True)
+    df_today["__date_dt"] = d0
+
+    # 2) Keep rows that successfully parsed
+    df_today = df_today[~df_today["__date_dt"].isna()].copy()
+
+    # 3) Compare by calendar date (no time)
+    df_today["__date_only"] = df_today["__date_dt"].dt.date
+    df_today = df_today[df_today["__date_only"] == date.today()].copy()
+
+    # 4) Use the parsed column as the display date
+    df_today["date"] = df_today["__date_dt"]
+
 
     st.subheader("🧾 Today's Transactions")
+# Debugging block — remove later
+st.caption("Debug: last 5 raw rows in session_state.transactions")
+if not st.session_state.transactions.empty:
+    st.write(st.session_state.transactions.tail()[["date","time_play","package","payment_method"]])
 
     if df_today.empty:
         st.info("No transactions for today yet.")
@@ -1244,3 +1261,4 @@ with coly:
 
 st.markdown("---")
 st.markdown("**Notes**: Income = rental + snack sales. Expenses are recorded in the Expenses section. BEP & CM use planning inputs (fixed costs & variable settings). ROI includes actual expenses.")
+
