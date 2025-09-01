@@ -1,5 +1,5 @@
 # BEE PLAY FINANCIAL REPORT - Streamlit Dashboard (Income + Expenses + Budgets)
-# Roles: staff (today input + edit + delete), team (full dashboard + edit/delete)
+# Roles: staff (today input + edit/delete), team (full dashboard + edit/delete)
 # Local autosave (CSV/JSON) + Google Sheets sync (transactions/expenses/settings)
 # Exports to Excel/PDF
 #
@@ -507,20 +507,70 @@ def gs_save_settings() -> bool:
     except Exception:
         return False
 
+# ---------- BOOTSTRAP LOAD (prevents overwrite on fresh session) ----------
+def bootstrap_load_once():
+    """
+    Load existing data from Google Sheets or local files once per browser session.
+    This MUST run before any autosave happens in a fresh session.
+    """
+    if st.session_state.get("_boot_loaded", False):
+        return
+    # Transactions
+    loaded_tx = gs_load_transactions() or load_csv()
+    # Expenses
+    loaded_ex = gs_load_expenses() or load_expenses_csv()
+    # Settings
+    loaded_st = gs_load_settings() or load_settings_json()
+    st.session_state["_boot_loaded"] = True
+
+# ---------- Pre-save merge safety (transactions) ----------
+def _merge_with_remote_transactions_before_save():
+    """
+    Pull remote transactions and merge with local (by tx_id) before we write to Sheets,
+    so we don't accidentally drop someone else's newly added rows.
+    """
+    try:
+        local = st.session_state.transactions.copy()
+        if gs_load_transactions():  # temporarily loads remote into session
+            remote = st.session_state.transactions.copy()
+            # restore local into session
+            st.session_state.transactions = local
+            merged = pd.concat([remote, local], ignore_index=True)
+            if "tx_id" in merged.columns:
+                merged = merged.drop_duplicates(subset=["tx_id"], keep="last")
+            st.session_state.transactions = merged.reset_index(drop=True)
+            return True
+        else:
+            st.session_state.transactions = local
+            return False
+    except Exception:
+        st.session_state.transactions = local
+        return False
+
 # ---------- Autosave everything ----------
 def autosave_all():
+    # Local copies
     try: st.session_state.transactions.to_csv("transactions.csv", index=False)
     except Exception: pass
     try: st.session_state.expenses.to_csv("expenses.csv", index=False)
     except Exception: pass
     try: save_settings_json("settings.json")
     except Exception: pass
-    try: gs_save_transactions()
-    except Exception: pass
-    try: gs_save_expenses()
-    except Exception: pass
-    try: gs_save_settings()
-    except Exception: pass
+
+    # Google Sheets: merge-then-save to avoid overwriting others' rows
+    try:
+        _merge_with_remote_transactions_before_save()
+        gs_save_transactions()
+    except Exception:
+        pass
+    try:
+        gs_save_expenses()
+    except Exception:
+        pass
+    try:
+        gs_save_settings()
+    except Exception:
+        pass
 
 # ---------- Filters & Metrics ----------
 def filter_by_range(df: pd.DataFrame, start: date, end: date) -> pd.DataFrame:
@@ -801,6 +851,9 @@ def add_expense_form(role_is_team: bool):
 
 # ---------- MAIN ----------
 init_state()
+# NEW: make sure we load persisted data before anyone can save anything
+bootstrap_load_once()
+
 ensure_tx_ids()
 ensure_exp_ids()
 ensure_budget_keys()
@@ -842,11 +895,6 @@ if role == "staff":
         df_today = df_today[df_today["__date_only"] == date.today()].copy()
         df_today["date"] = df_today["__date_dt"]
 
-    # Debug (remove later)
-    st.caption("Debug: last 5 raw rows in session_state.transactions")
-    if not st.session_state.transactions.empty:
-        st.write(st.session_state.transactions.tail()[["date","time_play","package","payment_method"]])
-
     if df_today.empty:
         st.info("No transactions for today yet.")
     else:
@@ -864,7 +912,7 @@ if role == "staff":
             view_today,
             use_container_width=True,
             num_rows="fixed",
-            disabled=False,  # NOW EDITABLE for staff
+            disabled=False,  # EDITABLE for staff
             column_config={
                 "date": st.column_config.DateColumn(format="YYYY-MM-DD"),
                 "time_play": st.column_config.TextColumn(help="24h HH:MM"),
@@ -898,7 +946,6 @@ if role == "staff":
 
                 ed_lookup = edited.set_index("tx_id")
                 mask = master["tx_id"].isin(today_ids)
-                # Map ONLY today's rows
                 for col in ["date","time_play","package","hours","rental_revenue","snack_type","snack_revenue","payment_method"]:
                     master.loc[mask, col] = master.loc[mask, "tx_id"].map(ed_lookup[col])
 
@@ -917,8 +964,7 @@ if role == "staff":
                     master = st.session_state.transactions.copy()
                     master["tx_id"] = master.get("tx_id", pd.Series([None]*len(master))).astype(str)
                     today_ids = set(df_today["tx_id"].astype(str).tolist())
-                    # only delete today's rows
-                    filtered = [x for x in to_del_ids if x in today_ids]
+                    filtered = [x for x in to_del_ids if x in today_ids]  # only delete today's rows
                     before = len(master)
                     master = master[~master["tx_id"].isin(filtered)].reset_index(drop=True)
                     st.session_state.transactions = master
@@ -1092,7 +1138,6 @@ else:
     )
     edited_view["tx_id"] = edited_view["tx_id"].astype(str)
 
-    # Prepare labels for deletion chooser
     label_df = edited_view.copy()
     label_df["date"] = pd.to_datetime(label_df["date"], errors="coerce").dt.strftime("%Y-%m-%d").fillna("")
     label_df["label"] = (
@@ -1220,7 +1265,6 @@ else:
             master = master[~master["exp_id"].isin(del_ids)].reset_index(drop=True)
             st.session_state.expenses = master
             ensure_exp_ids()
-            autosave_all()
             after = len(master)
             st.success(f"Deleted {before - after} expense(s).")
             st.rerun()
